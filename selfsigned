@@ -1,0 +1,226 @@
+#!/bin/bash
+
+SUBJECT="/OU=Domain Validated"      # Default Subject.
+
+usage() {
+cat << EOF
+
+Usage:
+  `basename $0` [-r|-e] [-b 256|384|521|2048|4096] [-d 365] certificate.common.name [subject.alternate.name and/or subject.ip.address]
+
+  -h, -help,  --help         Display help.
+  -r, -rsa,   --rsa          Create RSA key of 2048 or 4096 bits.
+  -e, -ecc,   --ecc          Create ECC key of 256, 384, or 521 bits.
+  -b, -bits,  --bits         Key bit size. Defaults to 2048 for RSA, 256 for ECC.
+  -d, -days,  --days         Certificate validity period in days. Defaults to 365.
+  -s, -subj,  --subject      Certificate subject in form /C=/ST=/L=/O=/OU=/CN=/emailAddress=
+
+Examples:
+
+  #1: CN=sample.lab.home, sample@lab.home is a SAN
+  `basename $0` --ecc --bits 521 --days 3654 --subject "/C=AU/ST=Western Australia/O=Home" sample.lab.home sample@lab.home 127.0.0.1 ::1
+
+  #2: CN=first.lab.home, sample.lab.home is a SAN
+  `basename $0` --ecc --bits 521 --days 3654 --subject "/C=AU/ST=Western Australia/O=Home/CN=first.lab.home" sample.lab.home sample@lab.home 127.0.0.1 ::1
+
+EOF
+}
+
+# $@ is all command line parameters passed to the script.
+# -o is for short options like -v
+# -l is for long options with double dash like --version
+# the comma separates different long options
+# -a is for long options with single dash like -version
+OPTIONS=$(getopt -l "help,rsa,ecc,bits:,days:,subj:,subject:" -o "Vhreb:d:s:" -a -- "$@")
+
+# set --:
+# If no arguments follow this option, then the positional parameters are unset. Otherwise, the positional parameters
+# are set to the arguments, even if some of them begin with a '-'.
+eval set -- "$OPTIONS"
+
+RSA=0
+ECC=0
+BITS=0
+DAYS=365
+
+while true
+do
+case "$1" in
+-h|--help)
+    usage
+    exit 0
+    ;;
+-b|--bits)
+    shift
+    BITS="$1"
+    ;;
+-d|--days)
+    shift
+    DAYS="$1"
+    ;;
+-V|--verbose)
+    set -xv  # Set xtrace and verbose mode.
+    ;;
+-r|--rsa)
+    RSA=1
+    ;;
+-e|--ecc)
+    ECC=1
+    ;;
+-s|--subj|--subject)
+    shift
+    SUBJECT="$1"
+    ;;
+--)
+    shift
+    break;;
+esac
+shift
+done
+
+COUNTRY=`echo "$SUBJECT" | sed 's/ = /=/g' | sed -n 's/^.*[Cc]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+STATE=`echo "$SUBJECT" | sed 's/ = /=/g' | sed -n 's/^.*[Ss][Tt]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+LOCATION=`echo "$SUBJECT" | sed 's/ = /=/g' | sed -n 's/^.*[Ll]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+ORG=`echo "$SUBJECT" | sed 's/ = /=/g' | sed -n 's/^.*[Oo]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+ORGUNIT=`echo "$SUBJECT" | sed 's/ = /=/g' | sed -n 's/^.*[Oo][Uu]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+CN=`echo "$SUBJECT" | sed 's/ = /=/g' | sed -n 's/^.*[Cc][Nn]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+EMAIL=`echo "$SUBJECT" | sed 's/ = /=/g' | sed -n 's/^.*[eE][mM][aA][iI][lL][aA][dD][dD][rR][eE][sS][sS]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+
+if [[ "x$CN" == "x" && "x$1" == "x" ]]
+then
+    usage
+    exit 1
+elif [[ "x$CN" == "x" ]]
+then
+    URL=$1
+    CN=`echo $URL | sed "s/\/.*//"`
+    EMAIL=`echo "$URL" | sed 's/ = /=/g' | sed -n 's/^.*[eE][mM][aA][iI][lL][aA][dD][dD][rR][eE][sS][sS]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+fi
+
+CERTORG=''
+if [ "x$COUNTRY" != "x" ]; then CERTORG="${CERTORG}/C=$COUNTRY"; fi
+if [ "x$STATE" != "x" ]; then CERTORG="${CERTORG}/ST=$STATE"; fi
+if [ "x$LOCATION" != "x" ]; then CERTORG="${CERTORG}/L=$LOCATION"; fi
+if [ "x$ORG" != "x" ]; then CERTORG="${CERTORG}/O=$ORG"; fi
+if [ "x$ORGUNIT" != "x" ]; then CERTORG="${CERTORG}/OU=$ORGUNIT"; fi
+
+FILE=`echo "$CN" | sed "s/\./_/g" | sed "s/\*/star/g" | sed "s/\/.*//"`
+if [ -f "$FILE.csr" ]; then rm -f "$FILE.csr"; fi
+if [ -f "$FILE.crt" ]; then rm -f "$FILE.crt"; fi
+if [ -f "$FILE.key" ]; then rm -f "$FILE.key"; fi
+
+# Remove the / from the end of CERTORG if it exists.
+SUBJ="${CERTORG/%\//}/CN=$CN"
+if [ "x$EMAIL" != "x" ]; then SUBJ="$SUBJ/emailAddress=$EMAIL"; fi
+
+SAN="DNS:"$CN
+# If CN is a wildcard, add base domain as SAN.
+if [[ $CN = "*."* ]]
+then
+  SAN=$SAN",DNS:"`echo $CN | sed "s/\*\.//g"`
+fi
+
+# Check it CN was in supplied subject. That means first arg is not CN but first SAN
+if [[ "x$1" != "x$CN" && "x$1" != "x" ]]
+then
+    if [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        SAN=${SAN},"IP:$1"
+    elif [[ $1 =~ ":" ]]; then  # assume IPv6
+        SAN=${SAN},"IP:$1"
+    elif [[ $1 =~ "@" ]]; then  # assume email
+        SAN=${SAN},"email:$1"
+    else
+        SAN=${SAN},"DNS:$1"
+    fi
+fi
+
+# Add commandline subject alternates
+if [ $# -gt 1 ]
+then
+    sans=($@)
+    i=1
+    while [ $i -lt ${#sans[@]} ]
+    do
+        if [[ ${sans[i]} =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            SAN=${SAN},"IP:${sans[i]}"
+        elif [[ ${sans[i]} =~ ":" ]]; then  # assume IPv6
+            SAN=${SAN},"IP:${sans[i]}"
+        elif [[ ${sans[i]} =~ "@" ]]; then  # assume email
+            SAN=${SAN},"email:${sans[i]}"
+        else
+            SAN=${SAN},"DNS:${sans[i]}"
+        fi
+        i=$[$i+1]
+    done
+fi
+
+if [[ $RSA -eq 1 && $ECC -eq 1 ]]
+then
+    echo "Can not create a RSA and a ECC key."
+    exit 1
+fi
+
+if [[ $RSA -eq 0 && $ECC -eq 0 ]]
+then
+    if [[ $BITS -eq 521 || $BITS -eq 384 || $BITS -eq 256 ]]
+    then
+        ECC=1
+    elif [[ $BITS -eq 2048 || $BITS -eq 4096 ]]
+    then
+        RSA=1
+    else
+        RSA=1
+    fi
+fi
+
+if [[ $ECC -eq 1 && ( $BITS -ne 521 && $BITS -ne 384 && $BITS -ne 256 && $BITS -ne 0 ) ]]
+then
+    echo "ECC keys can only be 256, 384, or 521 bits"
+    exit 1
+fi
+
+if [[ $RSA -eq 1 && ( $BITS -ne 2048 && $BITS -ne 4096 && $BITS -ne 0 ) ]]
+then
+    echo "RSA keys can only be 2048 or 4096 bits"
+    exit 1
+fi
+
+if [[ $RSA -eq 1 ]]
+then
+    if [[ $BITS -eq 0 ]]; then BITS=2048; fi
+    KEY="rsa"
+    KEYOPT="rsa_keygen_bits:$BITS"
+fi
+
+if [[ $ECC -eq 1 ]]
+then
+    if [[ $BITS -eq 0 ]]; then BITS=256; fi
+    KEY="ec"
+    if [[ $BITS -eq 256 ]]; then KEYOPT="ec_paramgen_curve:prime256v1"; else KEYOPT="ec_paramgen_curve:secp${BITS}r1"; fi
+fi
+
+openssl req -new -x509 -newkey $KEY -pkeyopt $KEYOPT -nodes -days $DAYS -sha256 \
+-subj "$SUBJ" \
+-out "$FILE.crt" \
+-keyout "$FILE.key" \
+-extensions exts \
+-config <(cat \
+<(printf "[ req ]\n") \
+<(printf "distinguished_name=req\n") \
+<(printf "[ exts ]\n") \
+<(printf "subjectKeyIdentifier=hash\n") \
+<(printf "authorityKeyIdentifier=keyid:always,issuer\n") \
+<(printf "subjectAltName=$SAN\n") \
+<(printf "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign\n") \
+<(printf "extendedKeyUsage=serverAuth,clientAuth\n") \
+<(printf "basicConstraints=critical,CA:true\n") \
+)   >/dev/null 2>"$FILE.err"
+RES=$?
+
+echo -e "openssl returned: $RES"
+
+if [[ $RES -eq 0 ]]
+then
+    openssl verify -CAfile ${FILE}.crt ${FILE}.crt
+    rm -f "$FILE.err"
+fi

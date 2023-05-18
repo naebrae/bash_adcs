@@ -1,0 +1,293 @@
+#!/bin/bash
+
+ADCS="ca.ad.lab.home"               # Active Directory Certificate Services
+SUBJECT="/OU=Domain Validated"      # Default Subject.
+TEMPLATE="WebServer"                # Default Template on the ADCS
+PFXPWD="changeit"                   # Password of created PFX
+
+usage() {
+cat << EOF
+
+Usage:
+  `basename $0` [-r|-e] [-b 256|384|521|2048|4096] [-s "/C=/ST=/O="] [-t WebServer] [-u AD_Username ] [-p AD_Password] certificate.common.name [subject.alt.name|subject.I.P.address]
+
+  -h, -help,  --help         Display help.
+  -r, -rsa,   --rsa          Create RSA key of 2048 or 4096 bits.
+  -e, -ecc,   --ecc          Create ECC key of 256, 384, or 521 bits.
+  -b, -bits,  --bits         Key bit size. Defaults to 2048 for RSA, 256 for ECC.
+  -s, -subj,  --subject      Certificate subject in form /C=/ST=/L=/O=/OU=/CN=/emailAddress=  (default: "/OU=Domain Validated/CN=")
+  -t, -temp,  --template     ADCS Template (default: WebServer)
+  -u, -user,  --username     Active Directory Username
+  -p, -pass,  --password     Active Directory Password
+
+Examples:
+
+  #1: CN=sample.lab.home
+  `basename $0` --ecc --bits 384 --subject "/C=AU/ST=Western Australia/O=Home" sample.lab.home sample@lab.home 127.0.0.1
+
+  #2: CN=first.lab.home, sample.lab.home is added to Subject Alternate Name
+  `basename $0` --ecc --bits 384 --subject "/C=AU/ST=Western Australia/O=Home/CN=first.lab.home" sample.lab.home sample@lab.home 127.0.0.1
+
+EOF
+}
+
+# $@ is all command line parameters passed to the script.
+# -o is for short options like -v
+# -l is for long options with double dash like --version
+# the comma separates different long options
+# -a is for long options with single dash like -version
+OPTIONS=$(getopt -l "help,rsa,ecc,bits:,subj:,subject:,temp:,template:,user:,username:,pass:,password:" -o "Vhreb:s:t:u:p:" -a -- "$@")
+
+# set --:
+# If no arguments follow this option, then the positional parameters are unset. Otherwise, the positional parameters
+# are set to the arguments, even if some of them begin with a '-'.
+eval set -- "$OPTIONS"
+
+RSA=0
+ECC=0
+BITS=0
+
+while true
+do
+case "$1" in
+-h|--help)
+    usage
+    exit 0
+    ;;
+-b|--bits)
+    shift
+    BITS="$1"
+    ;;
+-V|--verbose)
+    set -xv  # Set xtrace and verbose mode.
+    ;;
+-r|--rsa)
+    RSA=1
+    ;;
+-e|--ecc)
+    ECC=1
+    ;;
+-s|--subj|--subject)
+    shift
+    SUBJECT="$1"
+    ;;
+-t|--temp|--template)
+    shift
+    TEMPLATE="$1"
+    ;;
+-u|--user|--username)
+    shift
+    USERNAME="$1"
+    ;;
+-p|--pass|--password)
+    shift
+    PASSWORD="$1"
+    ;;
+--)
+    shift
+    break;;
+esac
+shift
+done
+
+
+COUNTRY=`echo "$SUBJECT" | sed 's/ = /=/g' | sed -n 's/^.*[Cc]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+STATE=`echo "$SUBJECT" | sed 's/ = /=/g' | sed -n 's/^.*[Ss][Tt]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+LOCATION=`echo "$SUBJECT" | sed 's/ = /=/g' | sed -n 's/^.*[Ll]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+ORG=`echo "$SUBJECT" | sed 's/ = /=/g' | sed -n 's/^.*[Oo]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+ORGUNIT=`echo "$SUBJECT" | sed 's/ = /=/g' | sed -n 's/^.*[Oo][Uu]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+CN=`echo "$SUBJECT" | sed 's/ = /=/g' | sed -n 's/^.*[Cc][Nn]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+EMAIL=`echo "$SUBJECT" | sed 's/ = /=/g' | sed -n 's/^.*[eE][mM][aA][iI][lL][aA][dD][dD][rR][eE][sS][sS]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+
+if [[ "x$CN" == "x" && "x$1" == "x" ]]
+then
+    usage
+    exit 1
+elif [[ "x$CN" == "x" ]]
+then
+    URL=$1
+    CN=`echo $URL | sed "s/\/.*//"`
+    EMAIL=`echo "$URL" | sed 's/ = /=/g' | sed -n 's/^.*[eE][mM][aA][iI][lL][aA][dD][dD][rR][eE][sS][sS]=//p' | sed 's/\/.*//' | sed 's/,.*//'`
+fi
+
+CERTORG=''
+if [ "x$COUNTRY" != "x" ]; then CERTORG="${CERTORG}/C=$COUNTRY"; fi
+if [ "x$STATE" != "x" ]; then CERTORG="${CERTORG}/ST=$STATE"; fi
+if [ "x$LOCATION" != "x" ]; then CERTORG="${CERTORG}/L=$LOCATION"; fi
+if [ "x$ORG" != "x" ]; then CERTORG="${CERTORG}/O=$ORG"; fi
+if [ "x$ORGUNIT" != "x" ]; then CERTORG="${CERTORG}/OU=$ORGUNIT"; fi
+
+FILE=`echo "$CN" | sed "s/\./_/g" | sed "s/\*/star/g" | sed "s/\/.*//"`
+if [ -f "$FILE.csr" ]; then rm -f "$FILE.csr"; fi
+
+# Remove the / from the end of CERTORG if it exists.
+SUBJ="${CERTORG/%\//}/CN=$CN"
+if [ "x$EMAIL" != "x" ]; then SUBJ="$SUBJ/emailAddress=$EMAIL"; fi
+
+SAN="DNS:"$CN
+# If CN is a wildcard, add base domain as SAN.
+if [[ $CN = "*."* ]]
+then
+  SAN=$SAN",DNS:"`echo $CN | sed "s/\*\.//g"`
+fi
+
+# Check it CN was in supplied subject. That means first arg is not CN but first SAN
+if [[ "x$1" != "x$CN" && "x$1" != "x" ]]
+then
+    if [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        SAN=${SAN},"IP:$1"
+    elif [[ $1 =~ ":" ]]; then  # assume IPv6
+        SAN=${SAN},"IP:$1"
+    elif [[ $1 =~ "@" ]]; then  # assume email
+        SAN=${SAN},"email:$1"
+    else
+        SAN=${SAN},"DNS:$1"
+    fi
+fi
+
+# Add commandline subject alternates
+if [ $# -gt 1 ]
+then
+    sans=($@)
+    i=1
+    while [ $i -lt ${#sans[@]} ]
+    do
+        if [[ ${sans[i]} =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            SAN=${SAN},"IP:${sans[i]}"
+        elif [[ ${sans[i]} =~ ":" ]]; then  # assume IPv6
+            SAN=${SAN},"IP:${sans[i]}"
+        elif [[ ${sans[i]} =~ "@" ]]; then  # assume email
+            SAN=${SAN},"email:${sans[i]}"
+        else
+            SAN=${SAN},"DNS:${sans[i]}"
+        fi
+        i=$[$i+1]
+    done
+fi
+
+if [[ $RSA -eq 1 && $ECC -eq 1 ]]
+then
+    echo "Can not create a RSA and a ECC key."
+    exit 1
+fi
+
+if [[ $RSA -eq 0 && $ECC -eq 0 ]]
+then
+    if [[ $BITS -eq 521 || $BITS -eq 384 || $BITS -eq 256 ]]
+    then
+        ECC=1
+    elif [[ $BITS -eq 2048 || $BITS -eq 4096 ]]
+    then
+        RSA=1
+    else
+        RSA=1
+    fi
+fi
+
+if [[ $ECC -eq 1 && ( $BITS -ne 521 && $BITS -ne 384 && $BITS -ne 256 && $BITS -ne 0 ) ]]
+then
+    echo "ECC keys can only be 256, 384, or 521 bits"
+    exit 1
+fi
+
+if [[ $RSA -eq 1 && ($BITS -ne 2048 && $BITS -ne 4096 && $BITS -ne 0 ) ]]
+then
+    echo "RSA keys can only be 2048 or 4096 bits"
+    exit 1
+fi
+
+if [[ $RSA -eq 1 ]]
+then
+    if [[ $BITS -eq 0 ]]; then BITS=2048; fi
+    KEY="rsa"
+    KEYOPT="rsa_keygen_bits:$BITS"
+fi
+
+if [[ $ECC -eq 1 ]]
+then
+    if [[ $BITS -eq 0 ]]; then BITS=256; fi
+    KEY="ec"
+    if [[ $BITS -eq 256 ]]; then KEYOPT="ec_paramgen_curve:prime256v1"; else KEYOPT="ec_paramgen_curve:secp${BITS}r1"; fi
+fi
+
+if [[ "x$USERNAME" == "x" ]]; then read -p "Username: " USERNAME; fi
+if [[ "x$PASSWORD" == "x" ]]
+then
+    read -s -p "Password: " PASSWORD
+    echo
+fi
+
+openssl req -newkey $KEY -pkeyopt $KEYOPT -nodes \
+-keyout "$FILE.key" \
+-out "$FILE.csr" \
+-subj "$SUBJ" \
+-reqexts req_ext \
+-config <(cat \
+<(printf "oid_section=new_oids\n") \
+<(printf "[ new_oids ]\n") \
+<(printf "certificateTemplate=1.3.6.1.4.1.311.20.2\n") \
+<(printf "[ req ]\n") \
+<(printf "distinguished_name=req_distinguished_name\n") \
+<(printf "[ req_distinguished_name ]\n") \
+<(printf "[ req_ext ]\n") \
+<(printf "keyUsage=critical,keyEncipherment,dataEncipherment\n") \
+<(printf "certificateTemplate=ASN1:BMP:$TEMPLATE\n") \
+<(printf "subjectKeyIdentifier=hash\n") \
+<(printf "subjectAltName=$SAN\n") \
+) 2>/dev/null
+RES=$?
+
+
+if [[ $RES -ne 0 ]]
+then
+    echo "Error $RES crearing CSR"
+    exit 1
+fi
+
+SIGNREQ=`cat "$FILE.csr" | tr -d '\n\r'`
+SIGNREQ=`echo ${SIGNREQ} | sed 's/+/%2B/g'`
+SIGNREQ=`echo ${SIGNREQ} | tr -s ' ' '+'`
+
+OUTPUT=`curl -s -k -u "${USERNAME}":${PASSWORD} --ntlm \
+"https://${ADCS}/certsrv/certfnsh.asp" \
+-H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+-H 'Accept-Encoding: gzip, deflate' \
+-H 'Accept-Language: en-US,en;q=0.5' \
+-H 'Connection: keep-alive' \
+-H "Host: ${ADCS}" \
+-H "Referer: https://${ADCS}/certsrv/certrqxt.asp" \
+-H 'User-Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko' \
+-H 'Content-Type: application/x-www-form-urlencoded' \
+--data "Mode=newreq&CertRequest=${SIGNREQ}&CertAttrib=&TargetStoreFlags=0&SaveCert=yes&ThumbPrint="`
+
+echo "$OUTPUT" | grep "<title>" | sed "s/<title>//" | sed "s/<\/title>//"
+echo "$OUTPUT" | grep "<P ID=locPageTitle>" | sed "s/<P ID=locPageTitle> <B> //" | sed "s/ <\/B>//"
+
+OUTPUTLINK=`echo "$OUTPUT" | grep -A 1 'function handleGetChain() {' | tail -n 1 | cut -d '"' -f 2`
+
+if [ "x${OUTPUTLINK}" == "x" ]
+then
+    exit 1
+fi
+
+CERTLINK="https://${ADCS}/certsrv/${OUTPUTLINK}Enc=b64"
+
+curl -s -k -u "${USERNAME}":${PASSWORD} --ntlm $CERTLINK -o $FILE.p7b \
+-H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+-H 'Accept-Encoding: gzip, deflate' \
+-H 'Accept-Language: en-US,en;q=0.5' \
+-H 'Connection: keep-alive' \
+-H "Host: ${ADCS}" \
+-H "Referer: https://${ADCS}/certsrv/certrqxt.asp" \
+-H 'User-Agent: Mozilla/5.0 (Windows NT 6.3; WOW64; Trident/7.0; rv:11.0) like Gecko'
+
+if [[ `grep -c title $FILE.p7b` -ne 0 ]]
+then
+    echo
+    grep title $FILE.p7b
+    exit 1
+fi
+
+openssl pkcs7 -print_certs -in $FILE.p7b -inform PEM -out $FILE.txt
+openssl x509 -in $FILE.txt -out $FILE.crt
+openssl pkcs12 -export -in $FILE.txt -inkey $FILE.key -out $FILE.pfx -name $FILE -password pass:$PFXPWD
